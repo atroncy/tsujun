@@ -4,7 +4,7 @@ import java.util.*
 
 data class ResponseTable(val sequence: Int,
                          val sql: String,
-                         val mode: Int,
+                         val mode: Int = 1,
                          val data: Array<Any>) {
 
     override fun equals(other: Any?): Boolean {
@@ -28,4 +28,12 @@ data class ResponseTable(val sequence: Int,
         result = 31 * result + Arrays.hashCode(data)
         return result
     }
+}
+
+public fun statementsResponseTable(request: Request, stmt: String): ResponseTable {
+    return ResponseTable(
+            sequence = request.sequence,
+            sql = request.sql,
+            data = arrayOf("Statement :", stmt)
+    )
 }

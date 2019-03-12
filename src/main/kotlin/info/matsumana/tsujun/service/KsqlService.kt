@@ -1,7 +1,9 @@
 package info.matsumana.tsujun.service
 
 import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ArrayNode
 import com.fasterxml.jackson.module.kotlin.KotlinModule
 import com.fasterxml.jackson.module.kotlin.readValue
 import info.matsumana.tsujun.config.KsqlServerConfig
@@ -9,6 +11,7 @@ import info.matsumana.tsujun.exception.KsqlException
 import info.matsumana.tsujun.model.Request
 import info.matsumana.tsujun.model.ResponseTable
 import info.matsumana.tsujun.model.ksql.*
+import info.matsumana.tsujun.model.statementsResponseTable
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.stereotype.Service
@@ -18,6 +21,11 @@ import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import java.io.IOException
 import java.util.*
+import io.netty.handler.timeout.WriteTimeoutHandler
+import io.netty.handler.timeout.ReadTimeoutHandler
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
+import reactor.netty.http.client.HttpClient
+
 
 @Service
 class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
@@ -26,6 +34,8 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
         private val logger = LoggerFactory.getLogger(this::class.java.enclosingClass)
         private val mapper = ObjectMapper().registerModule(KotlinModule())
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+        private val TYPE_COMMAND_DESCRIBE = "DESCRIBE"
+        private val TYPE_COMMAND_ = "DESCRIBE"
         private val REGEX_SELECT = Regex("""^SELECT\s+?.*""", RegexOption.IGNORE_CASE)
         private val REGEX_DESCRIBE = Regex("""^DESCRIBE\s+?.*""", RegexOption.IGNORE_CASE)
         private val REGEX_QUERIES = Regex("""^(LIST|SHOW)\s+?QUERIES(\s|;)*""", RegexOption.IGNORE_CASE)
@@ -78,6 +88,49 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
         }
     }
 
+    private fun command(request: Request): Flux<ResponseTable> {
+        return commandClient(request)
+                .flatMap { commandsResult ->
+
+                    val responseTables = mutableListOf<ResponseTable>()
+                    for (jsonNode in commandsResult) {
+                        val typeCommand = jsonNode.path("@type").asText()
+                        if (typeCommand.isEmpty()) {
+                            continue
+                        }
+                        when(typeCommand) {
+                            TYPE_COMMAND_DESCRIBE -> responseTables.addAll(handleDescribe(request, jsonNode))
+                        }
+
+                    }
+                    Flux.fromIterable(responseTables)
+                }
+    }
+
+    private fun handleDescribe(request: Request, json: JsonNode): List<ResponseTable> {
+        val res = mapper.convertValue<KsqlResponseDescribe>(json, KsqlResponseDescribe::class.java)
+        val headerTable = ResponseTable(sequence = request.sequence,
+                sql = request.sql,
+                mode = 1,
+                data = arrayOf("Name :", res.sourceDescription.name))
+
+        val headerFields = ResponseTable(sequence = request.sequence,
+                sql = request.sql,
+                mode = 1,
+                data = arrayOf("Field ", "Type"))
+
+        val data = res.sourceDescription.fields.map { (name, schema) ->
+            ResponseTable(sequence = request.sequence,
+                    sql = request.sql,
+                    mode = 1,
+                    data = arrayOf(name, schema.type))
+        }
+
+        val list = mutableListOf(statementsResponseTable(request, res.statementText), headerTable, headerFields)
+        list.addAll(data)
+        return list
+    }
+
     private fun select(request: Request): Flux<ResponseTable> {
         // In the WebClient, sometimes the response gets cut off in the middle of json.
         // For example, as in the following log.
@@ -90,7 +143,17 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
 
         // TODO handle query stream limit timeout?.
 
-        return WebClient.create(ksqlServerConfig.server)
+        val httpClient = HttpClient.create().tcpConfiguration { client ->
+            client.doOnConnected({
+              it.addHandlerLast(ReadTimeoutHandler(10)).addHandlerLast(WriteTimeoutHandler(10))
+            })
+        }
+
+
+        return WebClient.builder()
+                .clientConnector(ReactorClientHttpConnector(httpClient))
+                .baseUrl(ksqlServerConfig.server)
+                .build()
                 .post()
                 .uri("/query")
                 .body(Mono.just(KsqlRequest(request.sql, streamProperties)), KsqlRequest::class.java)
@@ -150,6 +213,8 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                 }
                 .map { res -> res[0] }
                 .flatMap { res ->
+
+
                     val headerTable = ResponseTable(sequence = request.sequence,
                             sql = request.sql,
                             mode = 1,
@@ -328,6 +393,18 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                 .body(Mono.just(KsqlRequest(request.sql)), KsqlRequest::class.java)
                 .retrieve()
                 .bodyToFlux(String::class.java)
+                .doOnError { e ->
+                    handleException(e, request)
+                }
+    }
+
+    private fun commandClient(request: Request): Flux<ArrayNode> {
+        return WebClient.create(ksqlServerConfig.server)
+                .post()
+                .uri("/ksql")
+                .body(Mono.just(KsqlRequest(request.sql)), KsqlRequest::class.java)
+                .retrieve()
+                .bodyToFlux(ArrayNode::class.java)
                 .doOnError { e ->
                     handleException(e, request)
                 }
