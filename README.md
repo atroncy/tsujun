@@ -9,11 +9,17 @@ Tsūjun is yet another Web UI for [KSQL](https://github.com/confluentinc/ksql).
 # Supporting KSQL syntax
 
 - SELECT
+- DESCRIBE
 - (LIST | SHOW) QUERIES
 - (LIST | SHOW) STREAMS
 - (LIST | SHOW) TABLES
+- (LIST | SHOW) TOPICS
 
 __*Other syntax will be supported in future version__
+
+# Tested KSQL
+
+- KSQL Server 5.1.0
 
 # Tested browsers
 

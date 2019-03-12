@@ -27,16 +27,22 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
         private val mapper = ObjectMapper().registerModule(KotlinModule())
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
         private val REGEX_SELECT = Regex("""^SELECT\s+?.*""", RegexOption.IGNORE_CASE)
+        private val REGEX_DESCRIBE = Regex("""^DESCRIBE\s+?.*""", RegexOption.IGNORE_CASE)
         private val REGEX_QUERIES = Regex("""^(LIST|SHOW)\s+?QUERIES(\s|;)*""", RegexOption.IGNORE_CASE)
         private val REGEX_STREAMS = Regex("""^(LIST|SHOW)\s+?STREAMS(\s|;)*""", RegexOption.IGNORE_CASE)
         private val REGEX_TABLES = Regex("""^(LIST|SHOW)\s+?TABLES(\s|;)*""", RegexOption.IGNORE_CASE)
+        private val REGEX_TOPICS = Regex("""^(LIST|SHOW)\s+?TOPICS(\s|;)*""", RegexOption.IGNORE_CASE)
         private val emptyResponseSelect = KsqlResponseSelect(KsqlResponseSelectColumns(arrayOf()))
         private val emptyResponseQueries =
-                arrayOf(KsqlResponseQueries(KsqlResponseQueriesInner("", arrayOf(KsqlResponseQueriesInnerQueries(KsqlResponseQueriesInnerQueriesId(""), "", "")))))
+                arrayOf(KsqlResponseQueries("", arrayOf(KsqlResponseQueriesInner("", "", ""))))
         private val emptyResponseStreams =
-                arrayOf(KsqlResponseStreams(KsqlResponseStreamsInner("", arrayOf(KsqlResponseStreamsInnerStreams("", "", "")))))
+                arrayOf(KsqlResponseStreams("", arrayOf(KsqlResponseStreamsInner("", "", ""))))
         private val emptyResponseTables =
-                arrayOf(KsqlResponseTables(KsqlResponseTablesInner("", arrayOf(KsqlResponseTablesInnerTables("", "", "", false)))))
+                arrayOf(KsqlResponseTables("", arrayOf(KsqlResponseTablesInner("", "", "", false))))
+        private val emptyResponseTopics =
+                arrayOf(KsqlResponseTopics("", arrayOf(KsqlResponseTopicsInner("", false, emptyArray(), 0, 0))))
+        private val emptyResponseDescribe =
+                arrayOf(KsqlResponseDescribe("", KsqlResponseDescribeInner("", arrayOf())))
     }
 
     fun execute(request: Request): Flux<ResponseTable> {
@@ -47,19 +53,25 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
         val sql = request.sql.trimStart().trimEnd()
         if (REGEX_SELECT.matches(sql)) {
             return select(request)
+        } else if (REGEX_DESCRIBE.matches(sql)) {
+            return describe(request)
         } else if (REGEX_QUERIES.matches(sql)) {
             return queries(request)
         } else if (REGEX_STREAMS.matches(sql)) {
             return streams(request)
         } else if (REGEX_TABLES.matches(sql)) {
             return tables(request)
+        } else if (REGEX_TOPICS.matches(sql)) {
+            return topics(request)
         } else {
             val rawMessage = """Currently, Tsūjun supports only the following syntax.
                 |
                 | - SELECT
+                | - DESCRIBE
                 | - (LIST | SHOW) QUERIES
                 | - (LIST | SHOW) STREAMS
                 | - (LIST | SHOW) TABLES
+                | - (LIST | SHOW) TOPICS
             """.trimMargin()
             val message = mapper.writeValueAsString(KsqlResponseErrorMessage(rawMessage, emptyList()))
             throw KsqlException(request.sequence, request.sql, HttpStatus.BAD_REQUEST.value(), message)
@@ -74,11 +86,14 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
         // 2017-12-28 20:54:27.832 DEBUG 70874 --- [ctor-http-nio-5] i.matsumana.tsujun.service.KsqlService   : {"r
         // 2017-12-28 20:54:27.833 DEBUG 70874 --- [ctor-http-nio-5] i.matsumana.tsujun.service.KsqlService   : ow":{"columns":["Page_27",0]},"errorMessage":null}
         val previousFailed = ArrayDeque<String>()
+        val streamProperties = mapOf("ksql.streams.auto.offset.reset" to "earliest")
+
+        // TODO handle query stream limit timeout?.
 
         return WebClient.create(ksqlServerConfig.server)
                 .post()
                 .uri("/query")
-                .body(Mono.just(KsqlRequest(request.sql)), KsqlRequest::class.java)
+                .body(Mono.just(KsqlRequest(request.sql, streamProperties)), KsqlRequest::class.java)
                 .retrieve()
                 .bodyToFlux(String::class.java)
                 .doOnError { e ->
@@ -108,12 +123,53 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                         }
                     }
                 }
-                .filter { res -> !res.row.columns.isEmpty() }
-                .map { res ->
+                .filter { (row) -> !row.columns.isEmpty() }
+                .map { (row) ->
                     ResponseTable(sequence = request.sequence,
                             sql = request.sql,
                             mode = 1,
-                            data = res.row.columns)
+                            data = row.columns)
+                }
+    }
+
+    private fun describe(request: Request): Flux<ResponseTable> {
+        return generateWebClientKsql(request)
+                .map { orgString ->
+                    logger.debug(orgString)
+
+                    val s = orgString.trim()
+                    if (s.isEmpty()) {
+                        emptyResponseDescribe
+                    } else {
+                        try {
+                            mapper.readValue<Array<KsqlResponseDescribe>>(s)
+                        } catch (ignore: IOException) {
+                            emptyResponseDescribe
+                        }
+                    }
+                }
+                .map { res -> res[0] }
+                .flatMap { res ->
+                    val headerTable = ResponseTable(sequence = request.sequence,
+                            sql = request.sql,
+                            mode = 1,
+                            data = arrayOf("Name :", res.sourceDescription.name))
+
+                    val headerFields = ResponseTable(sequence = request.sequence,
+                            sql = request.sql,
+                            mode = 1,
+                            data = arrayOf("Field ", "Type"))
+
+                    val data = res.sourceDescription.fields.map { (name, schema) ->
+                        ResponseTable(sequence = request.sequence,
+                                sql = request.sql,
+                                mode = 1,
+                                data = arrayOf(name, schema.type))
+                    }
+
+                    val list = mutableListOf(headerTable, headerFields)
+                    list.addAll(data)
+                    Flux.fromIterable(list)
                 }
     }
 
@@ -133,19 +189,19 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                         }
                     }
                 }
-                .map { res -> res.get(0) }
-                .filter { res -> !res.queries.queries.isEmpty() }
+                .map { res -> res[0] }
+                .filter { res -> !res.queries.isEmpty() }
                 .flatMap { res ->
                     val header = ResponseTable(sequence = request.sequence,
                             sql = request.sql,
                             mode = 1,
                             data = arrayOf("ID", "Kafka Topic", "Query String"))
 
-                    val data = res.queries.queries.map { m ->
+                    val data = res.queries.map { (id, kafkaTopic, queryString) ->
                         ResponseTable(sequence = request.sequence,
                                 sql = request.sql,
                                 mode = 1,
-                                data = arrayOf(m.id.id, m.kafkaTopic, m.queryString))
+                                data = arrayOf(id, kafkaTopic, queryString))
                     }
 
                     val list = mutableListOf(header)
@@ -170,19 +226,19 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                         }
                     }
                 }
-                .map { res -> res.get(0) }
-                .filter { res -> !res.streams.streams.isEmpty() }
+                .map { res -> res[0] }
+                .filter { res -> !res.streams.isEmpty() }
                 .flatMap { res ->
                     val header = ResponseTable(sequence = request.sequence,
                             sql = request.sql,
                             mode = 1,
                             data = arrayOf("Stream Name", "Ksql Topic", "Format"))
 
-                    val data = res.streams.streams.map { m ->
+                    val data = res.streams.map { (name, topic, format) ->
                         ResponseTable(sequence = request.sequence,
                                 sql = request.sql,
                                 mode = 1,
-                                data = arrayOf(m.name, m.topic, m.format))
+                                data = arrayOf(name, topic, format))
                     }
 
                     val list = mutableListOf(header)
@@ -207,19 +263,56 @@ class KsqlService(private val ksqlServerConfig: KsqlServerConfig) {
                         }
                     }
                 }
-                .map { res -> res.get(0) }
-                .filter { res -> !res.tables.tables.isEmpty() }
+                .map { res -> res[0] }
+                .filter { res -> !res.tables.isEmpty() }
                 .flatMap { res ->
                     val header = ResponseTable(sequence = request.sequence,
                             sql = request.sql,
                             mode = 1,
                             data = arrayOf("Stream Name", "Ksql Topic", "Format", "Windowed"))
 
-                    val data = res.tables.tables.map { m ->
+                    val data = res.tables.map { (name, topic, format, isWindowed) ->
                         ResponseTable(sequence = request.sequence,
                                 sql = request.sql,
                                 mode = 1,
-                                data = arrayOf(m.name, m.topic, m.format, m.isWindowed))
+                                data = arrayOf(name, topic, format, isWindowed))
+                    }
+
+                    val list = mutableListOf(header)
+                    list.addAll(data)
+                    Flux.fromIterable(list)
+                }
+    }
+
+    private fun topics(request: Request): Flux<ResponseTable> {
+        return generateWebClientKsql(request)
+                .map { orgString ->
+                    logger.debug(orgString)
+
+                    val s = orgString.trim()
+                    if (s.isEmpty()) {
+                        emptyResponseTopics
+                    } else {
+                        try {
+                            mapper.readValue<Array<KsqlResponseTopics>>(s)
+                        } catch (ignore: IOException) {
+                            emptyResponseTopics
+                        }
+                    }
+                }
+                .map { res -> res[0] }
+                .filter { res -> !res.topics.isEmpty() }
+                .flatMap { res ->
+                    val header = ResponseTable(sequence = request.sequence,
+                            sql = request.sql,
+                            mode = 1,
+                            data = arrayOf("Kafka Topic", "Registered", "Partitions", "Partitions Replicas", "Consumer", "ConsumerGroups"))
+
+                    val data = res.topics.map { (name, registered, replicaInfo, consumerCount, consumerGroupCount) ->
+                        ResponseTable(sequence = request.sequence,
+                                sql = request.sql,
+                                mode = 1,
+                                data = arrayOf(name, registered, replicaInfo.size, replicaInfo.max().toString(), consumerCount, consumerGroupCount))
                     }
 
                     val list = mutableListOf(header)

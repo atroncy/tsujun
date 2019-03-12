@@ -6,4 +6,4 @@ management:
 
 logging:
   level:
-    info.matsumana.tsujun: INFO
+    info.matsumana.tsujun: DEBUG

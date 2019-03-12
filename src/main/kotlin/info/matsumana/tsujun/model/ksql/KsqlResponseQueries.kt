@@ -1,9 +1,7 @@
 package info.matsumana.tsujun.model.ksql
 
-data class KsqlResponseQueries(val queries: KsqlResponseQueriesInner)
+data class KsqlResponseQueries(val statementText: String, val queries: Array<KsqlResponseQueriesInner>)
 
-data class KsqlResponseQueriesInner(val statementText: String, val queries: Array<KsqlResponseQueriesInnerQueries>)
+// TODO add sinks
+data class KsqlResponseQueriesInner(val id: String, val kafkaTopic: String, val queryString: String)
 
-data class KsqlResponseQueriesInnerQueries(val id: KsqlResponseQueriesInnerQueriesId, val kafkaTopic: String, val queryString: String)
-
-data class KsqlResponseQueriesInnerQueriesId(val id: String)
